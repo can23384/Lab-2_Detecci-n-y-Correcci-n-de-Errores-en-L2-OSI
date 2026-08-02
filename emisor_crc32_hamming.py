@@ -9,16 +9,19 @@ import socket
 IP_RECEPTOR = "127.0.0.1"
 PUERTO_RECEPTOR = 5000
 
-# 0.0 = sin ruido; 0.01 = aproximadamente 1 bit alterado por cada 100 bits.
-PROBABILIDAD_FLIP = 0.01
-
 # Polinomio generador de 33 bits para CRC-32.
 CRC32_POLYNOMIAL = f"{0x104C11DB7:033b}"
 MIN_DATA_BITS = 32
 
+ALGORITMOS = {
+    "1": "HAMMING",
+    "2": "CRC32",
+    "3": "AMBOS",
+}
+
 
 def solicitar_mensaje() -> str:
-    """Capa de aplicación: solicita únicamente el mensaje."""
+    """Capa de aplicación: solicita el texto a enviar."""
     while True:
         mensaje = input("Mensaje ASCII a enviar: ")
 
@@ -33,6 +36,45 @@ def solicitar_mensaje() -> str:
             continue
 
         return mensaje
+
+
+def solicitar_algoritmo() -> str:
+    """Capa de aplicación: solicita el algoritmo para comprobar la integridad."""
+    print("\n¿Qué algoritmo de integridad quieres usar?")
+    print("  1) Hamming(7,4)  -- corrección de errores")
+    print("  2) CRC-32        -- detección de errores")
+    print("  3) Ambos         -- CRC-32 + Hamming(7,4)")
+
+    while True:
+        opcion = input("Elige una opción [1/2/3]: ").strip()
+
+        if opcion in ALGORITMOS:
+            return ALGORITMOS[opcion]
+
+        print("Opción inválida. Escribe 1, 2 o 3.")
+
+
+def solicitar_probabilidad_ruido() -> float:
+    """Capa de ruido: solicita la tasa de error a aplicar sobre la trama."""
+    print(
+        "\n¿Con qué probabilidad se altera cada bit al transmitirlo? "
+        "(ej. 0.01 = 1 error por cada 100 bits)"
+    )
+
+    while True:
+        entrada = input("Probabilidad de ruido [0.0 - 1.0]: ").strip()
+
+        try:
+            probabilidad = float(entrada)
+        except ValueError:
+            print("Escribe un número decimal, por ejemplo 0.01.")
+            continue
+
+        if not 0.0 <= probabilidad <= 1.0:
+            print("La probabilidad debe estar entre 0 y 1.")
+            continue
+
+        return probabilidad
 
 
 def codificar_mensaje(mensaje: str) -> str:
@@ -104,13 +146,30 @@ def codificar_hamming_7_4(payload: str) -> str:
     )
 
 
+def calcular_integridad(datos_bits: str, algoritmo: str) -> str:
+    """
+    Capa de enlace: aplica el/los algoritmo(s) de integridad elegidos y
+    devuelve la trama final que se transmitirá.
+    """
+    if algoritmo == "CRC32":
+        payload = datos_bits + calcular_crc32(datos_bits)
+        return payload
+
+    if algoritmo == "HAMMING":
+        return codificar_hamming_7_4(datos_bits)
+
+    # AMBOS: primero se agrega el CRC, luego se protege todo con Hamming.
+    payload = datos_bits + calcular_crc32(datos_bits)
+    return codificar_hamming_7_4(payload)
+
+
 def aplicar_ruido(trama: str, probabilidad: float) -> tuple[str, int]:
     """Cambia cada bit de la trama con la probabilidad configurada."""
     if any(bit not in "01" for bit in trama):
         raise ValueError("La trama debe contener únicamente 0 y 1.")
 
     if not 0.0 <= probabilidad <= 1.0:
-        raise ValueError("PROBABILIDAD_FLIP debe estar entre 0 y 1.")
+        raise ValueError("La probabilidad de ruido debe estar entre 0 y 1.")
 
     resultado: list[str] = []
     cantidad_cambios = 0
@@ -125,14 +184,17 @@ def aplicar_ruido(trama: str, probabilidad: float) -> tuple[str, int]:
     return "".join(resultado), cantidad_cambios
 
 
-def enviar_trama(host: str, puerto: int, trama: str) -> None:
+def enviar_trama(host: str, puerto: int, algoritmo: str, trama: str) -> None:
     """
-    Envía únicamente la trama Hamming binaria.
-    El cierre de la conexión marca el final del mensaje.
+    Envía el modo de integridad usado (para que el receptor sepa cómo
+    decodificar) seguido de la trama binaria. El cierre de la conexión
+    marca el final del mensaje.
     """
+    mensaje_saliente = f"{algoritmo}\n{trama}"
+
     try:
         with socket.create_connection((host, puerto), timeout=10) as cliente:
-            cliente.sendall(trama.encode("ascii"))
+            cliente.sendall(mensaje_saliente.encode("ascii"))
     except ConnectionRefusedError as error:
         raise ConnectionError(
             "El receptor rechazó la conexión. Verifica que esté ejecutándose."
@@ -149,32 +211,43 @@ def main() -> None:
     print("=== EMISOR TCP: CRC-32 + HAMMING(7,4) ===")
 
     mensaje = solicitar_mensaje()
+    algoritmo = solicitar_algoritmo()
+    probabilidad_ruido = solicitar_probabilidad_ruido()
+
     bits_originales = codificar_mensaje(mensaje)
-    datos_con_padding = agregar_padding(bits_originales)
 
-    # Primero se agrega el CRC a los datos.
-    crc = calcular_crc32(datos_con_padding)
-    payload = datos_con_padding + crc
+    # El CRC-32 exige n > 32 bits (o padding si el mensaje es menor).
+    if algoritmo in ("CRC32", "AMBOS"):
+        datos = agregar_padding(bits_originales)
+    else:
+        datos = bits_originales
 
-    # Después se protege todo el payload, incluido el CRC, con Hamming(7,4).
-    trama_hamming = codificar_hamming_7_4(payload)
+    trama_sin_ruido = calcular_integridad(datos, algoritmo)
 
-    # El ruido se aplica sobre la trama que realmente viaja por el socket.
+    # El ruido se aplica sobre la trama que realmente viaja por el socket,
+    # incluyendo los bits de redundancia (paridad y/o CRC).
     trama_con_ruido, bits_cambiados = aplicar_ruido(
-        trama_hamming,
-        PROBABILIDAD_FLIP,
+        trama_sin_ruido,
+        probabilidad_ruido,
     )
+
+    overhead_bits = len(trama_sin_ruido) - len(bits_originales)
+    overhead_pct = (overhead_bits / len(bits_originales)) * 100
 
     print("\n--- Resumen ---")
     print(f"Mensaje: {mensaje!r}")
-    print(f"Datos binarios: {datos_con_padding}")
-    print(f"CRC-32: {crc}")
-    print(f"Payload antes de Hamming: {payload}")
-    print(f"Trama Hamming sin ruido: {trama_hamming}")
+    print(f"Algoritmo: {algoritmo}")
+    print(f"Probabilidad de ruido: {probabilidad_ruido}")
+    print(f"Datos binarios: {datos}")
+    print(f"Trama sin ruido: {trama_sin_ruido}")
     print(f"Trama enviada: {trama_con_ruido}")
     print(f"Bits alterados por ruido: {bits_cambiados}")
+    print(
+        f"Overhead: {overhead_bits} bits "
+        f"({overhead_pct:.1f}% sobre los datos originales)"
+    )
 
-    enviar_trama(IP_RECEPTOR, PUERTO_RECEPTOR, trama_con_ruido)
+    enviar_trama(IP_RECEPTOR, PUERTO_RECEPTOR, algoritmo, trama_con_ruido)
 
     print(
         f"\nTrama enviada correctamente a "

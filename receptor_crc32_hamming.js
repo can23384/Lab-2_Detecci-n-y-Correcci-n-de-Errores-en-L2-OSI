@@ -15,6 +15,8 @@ const CRC32_POLYNOMIAL = 0x104C11DB7n
 
 const CRC_BITS = 32;
 
+const ALGORITMOS_VALIDOS = new Set(["HAMMING", "CRC32", "AMBOS"]);
+
 
 function decodificarBloqueHamming74(bloque) {
   if (!/^[01]{7}$/.test(bloque)) {
@@ -181,43 +183,74 @@ function decodificarAscii(datosBits) {
 }
 
 
-function procesarTrama(tramaCruda) {
-  const trama = tramaCruda.trim();
+function verificarIntegridad(datosBits) {
+  const crcRecibido = datosBits.slice(-CRC_BITS);
+  const datos = datosBits.slice(0, -CRC_BITS);
+  const crcCalculado = calcularCRC32(datos);
 
-  if (!trama) {
+  return {
+    datos,
+    crcRecibido,
+    crcCalculado,
+    integridadValida: crcRecibido === crcCalculado,
+  };
+}
+
+
+function procesarTrama(tramaCruda) {
+  const contenido = tramaCruda.trim();
+
+  if (!contenido) {
     throw new Error("Se recibió una trama vacía.");
   }
 
-  if (!/^[01]+$/.test(trama)) {
+  const separador = contenido.indexOf("\n");
+
+  if (separador === -1) {
+    throw new Error(
+      "No se encontró el encabezado con el algoritmo utilizado."
+    );
+  }
+
+  const algoritmo = contenido.slice(0, separador).trim();
+  const trama = contenido.slice(separador + 1).trim();
+
+  if (!ALGORITMOS_VALIDOS.has(algoritmo)) {
+    throw new Error(`Algoritmo desconocido: "${algoritmo}".`);
+  }
+
+  if (!trama || !/^[01]+$/.test(trama)) {
     throw new Error(
       "La trama contiene caracteres distintos de 0 y 1."
     );
   }
 
+  let payload = trama;
+  let correcciones = [];
 
-  const {
-    payload,
-    correcciones,
-  } = decodificarHamming74(trama);
-
-  if (payload.length < CRC_BITS + 8) {
-    throw new Error(
-      "El payload es demasiado corto para contener datos y CRC-32."
-    );
+  if (algoritmo === "HAMMING" || algoritmo === "AMBOS") {
+    ({ payload, correcciones } = decodificarHamming74(trama));
   }
 
+  let datosBits = payload;
+  let crcRecibido = null;
+  let crcCalculado = null;
+  let integridadValida = true;
 
-  const datosBits =
-    payload.slice(0, -CRC_BITS);
+  if (algoritmo === "CRC32" || algoritmo === "AMBOS") {
+    if (payload.length < CRC_BITS + 8) {
+      throw new Error(
+        "El payload es demasiado corto para contener datos y CRC-32."
+      );
+    }
 
-  const crcRecibido =
-    payload.slice(-CRC_BITS);
+    const verificacion = verificarIntegridad(payload);
 
-  const crcCalculado =
-    calcularCRC32(datosBits);
-
-  const integridadValida =
-    crcRecibido === crcCalculado;
+    datosBits = verificacion.datos;
+    crcRecibido = verificacion.crcRecibido;
+    crcCalculado = verificacion.crcCalculado;
+    integridadValida = verificacion.integridadValida;
+  }
 
   let mensaje = null;
   let errorDecodificacion = null;
@@ -231,6 +264,7 @@ function procesarTrama(tramaCruda) {
   }
 
   return {
+    algoritmo,
     trama,
     payload,
     datosBits,
@@ -250,43 +284,48 @@ function mostrarResultado(resultado, remoto) {
   );
 
   console.log(`Conexión recibida desde ${remoto}`);
+  console.log(`Algoritmo: ${resultado.algoritmo}`);
   console.log(`Bits recibidos: ${resultado.trama.length}`);
 
-  console.log(
-    `Bloques Hamming: ${resultado.trama.length / 7}`
-  );
-
-  console.log(
-    `Bloques corregidos: ${resultado.correcciones.length}`
-  );
-
-  for (const correccion of resultado.correcciones) {
+  if (resultado.algoritmo === "HAMMING" || resultado.algoritmo === "AMBOS") {
     console.log(
-      `  - Bloque ${correccion.bloque}: ` +
-      `bit ${correccion.posicion} ` +
-      `(${correccion.recibido} -> ${correccion.corregido})`
+      `Bloques Hamming: ${resultado.trama.length / 7}`
     );
+
+    console.log(
+      `Bloques corregidos: ${resultado.correcciones.length}`
+    );
+
+    for (const correccion of resultado.correcciones) {
+      console.log(
+        `  - Bloque ${correccion.bloque}: ` +
+        `bit ${correccion.posicion} ` +
+        `(${correccion.recibido} -> ${correccion.corregido})`
+      );
+    }
   }
 
   console.log(
     `Datos recuperados: ${resultado.datosBits}`
   );
 
-  console.log(
-    `CRC recibido:       ${resultado.crcRecibido}`
-  );
-
-  console.log(
-    `CRC calculado:      ${resultado.crcCalculado}`
-  );
-
-  if (!resultado.integridadValida) {
-    console.error(
-      "ERROR: CRC-32 inválido. Quedaron errores que " +
-      "Hamming(7,4) no pudo corregir."
+  if (resultado.algoritmo === "CRC32" || resultado.algoritmo === "AMBOS") {
+    console.log(
+      `CRC recibido:       ${resultado.crcRecibido}`
     );
 
-    return;
+    console.log(
+      `CRC calculado:      ${resultado.crcCalculado}`
+    );
+
+    if (!resultado.integridadValida) {
+      console.error(
+        "ERROR: CRC-32 inválido. Quedaron errores que " +
+        "no pudieron ser corregidos."
+      );
+
+      return;
+    }
   }
 
   if (resultado.errorDecodificacion) {
